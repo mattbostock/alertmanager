@@ -16,12 +16,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
+	stdlog "log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,18 +38,10 @@ import (
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/notify"
 	"github.com/prometheus/alertmanager/provider/boltmem"
+	"github.com/prometheus/alertmanager/provider/gossip"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
-)
-
-var (
-	showVersion = flag.Bool("version", false, "Print version information.")
-
-	configFile = flag.String("config.file", "alertmanager.yml", "Alertmanager configuration file name.")
-	dataDir    = flag.String("storage.path", "data/", "Base path for data storage.")
-
-	externalURL   = flag.String("web.external-url", "", "The URL under which Alertmanager is externally reachable (for example, if Alertmanager is served via a reverse proxy). Used for generating relative and absolute links back to Alertmanager itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Alertmanager. If omitted, relevant URL components will be derived automatically.")
-	listenAddress = flag.String("web.listen-address", ":9093", "Address to listen on for the web interface and API.")
+	"github.com/weaveworks/mesh"
 )
 
 var (
@@ -68,6 +64,21 @@ func init() {
 }
 
 func main() {
+	peers := &stringset{}
+	var (
+		showVersion = flag.Bool("version", false, "print version information.")
+
+		configFile = flag.String("config.file", "alertmanager.yml", "Alertmanager configuration file name.")
+		dataDir    = flag.String("storage.path", "data/", "base path for data storage.")
+
+		externalURL   = flag.String("web.external-url", "", "URL under which Alertmanager is externally reachable")
+		listenAddress = flag.String("web.listen-address", ":9093", "address to listen on for the web interface and API.")
+
+		meshListen = flag.String("mesh", net.JoinHostPort("0.0.0.0", strconv.Itoa(mesh.Port)), "mesh listen address")
+		hwaddr     = flag.String("hwaddr", mustHardwareAddr(), "MAC address, i.e. mesh peer ID")
+		nickname   = flag.String("nickname", mustHostname(), "peer nickname")
+	)
+	flag.Var(peers, "peer", "initial peer (may be repeated)")
 	flag.Parse()
 
 	if *showVersion {
@@ -78,8 +89,40 @@ func main() {
 	log.Infoln("Starting alertmanager", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	err := os.MkdirAll(*dataDir, 0777)
+	host, portStr, err := net.SplitHostPort(*meshListen)
 	if err != nil {
+		log.Fatalf("mesh address: %s: %v", *meshListen, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		log.Fatalf("mesh address: %s: %v", *meshListen, err)
+	}
+
+	name, err := mesh.PeerNameFromString(*hwaddr)
+	if err != nil {
+		log.Fatalf("%s: %v", *hwaddr, err)
+	}
+
+	mrouter := mesh.NewRouter(mesh.Config{
+		Host:               host,
+		Port:               port,
+		ProtocolMinVersion: mesh.ProtocolMinVersion,
+		Password:           []byte(""),
+		ConnLimit:          64,
+		PeerDiscovery:      true,
+		TrustedSubnets:     []*net.IPNet{},
+	}, name, *nickname, mesh.NullOverlay{}, stdlog.New(ioutil.Discard, "", 0))
+
+	ni := gossip.NewNotificationInfo(name, log.With("peer", *nickname))
+	nic := mrouter.NewGossip("notify_info", ni)
+	ni.Register(nic)
+
+	mrouter.Start()
+	defer mrouter.Stop()
+
+	mrouter.ConnectionMaker.InitiateConnections(peers.slice(), true)
+
+	if err := os.MkdirAll(*dataDir, 0777); err != nil {
 		log.Fatal(err)
 	}
 
@@ -91,11 +134,11 @@ func main() {
 	}
 	defer alerts.Close()
 
-	notifies, err := boltmem.NewNotificationInfo(*dataDir)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer notifies.Close()
+	//notifies, err := boltmem.NewNotificationInfo(*dataDir)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//defer notifies.Close()
 
 	silences, err := boltmem.NewSilences(*dataDir, marker)
 	if err != nil {
@@ -123,7 +166,8 @@ func main() {
 			for i, n := range fo {
 				n = notify.Retry(n)
 				n = notify.Log(n, log.With("step", "retry"))
-				n = notify.Dedup(notifies, n)
+				//n = notify.Dedup(notifies, n)
+				n = notify.Dedup(ni, n)
 				n = notify.Log(n, log.With("step", "dedup"))
 
 				fo[i] = n
@@ -141,7 +185,7 @@ func main() {
 		return n
 	}
 
-	amURL, err := extURL(*externalURL)
+	amURL, err := extURL(*externalURL, *listenAddress)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -191,7 +235,7 @@ func main() {
 	api.Register(router.WithPrefix(path.Join(amURL.Path, "/api")))
 
 	log.Infoln("Listening on", *listenAddress)
-	go listen(router)
+	go listen(router, *listenAddress)
 
 	var (
 		hup  = make(chan os.Signal)
@@ -211,13 +255,13 @@ func main() {
 	log.Infoln("Received SIGTERM, exiting gracefully...")
 }
 
-func extURL(s string) (*url.URL, error) {
+func extURL(s, listenAddress string) (*url.URL, error) {
 	if s == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
 			return nil, err
 		}
-		_, port, err := net.SplitHostPort(*listenAddress)
+		_, port, err := net.SplitHostPort(listenAddress)
 		if err != nil {
 			return nil, err
 		}
@@ -239,8 +283,49 @@ func extURL(s string) (*url.URL, error) {
 	return u, nil
 }
 
-func listen(router *route.Router) {
-	if err := http.ListenAndServe(*listenAddress, router); err != nil {
+func listen(router *route.Router, listenAddress string) {
+	if err := http.ListenAndServe(listenAddress, router); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type stringset map[string]struct{}
+
+func (ss stringset) Set(value string) error {
+	ss[value] = struct{}{}
+	return nil
+}
+
+func (ss stringset) String() string {
+	return strings.Join(ss.slice(), ",")
+}
+
+func (ss stringset) slice() []string {
+	slice := make([]string, 0, len(ss))
+	for k := range ss {
+		slice = append(slice, k)
+	}
+	sort.Strings(slice)
+	return slice
+}
+
+func mustHardwareAddr() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		panic(err)
+	}
+	for _, iface := range ifaces {
+		if s := iface.HardwareAddr.String(); s != "" {
+			return s
+		}
+	}
+	panic("no valid network interfaces")
+}
+
+func mustHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		panic(err)
+	}
+	return hostname
 }
