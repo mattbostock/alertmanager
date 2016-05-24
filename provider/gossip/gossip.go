@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/prometheus/alertmanager/provider"
 	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
@@ -217,6 +219,244 @@ func (st *notificationState) Merge(other mesh.GossipData) mesh.GossipData {
 		if prev.Timestamp.Before(v.Timestamp) {
 			res.set[k] = v
 		}
+	}
+	return res
+}
+
+type Silences struct {
+	mtx    sync.RWMutex
+	logger log.Logger
+	st     *silenceState
+	send   mesh.Gossip
+	mk     types.Marker
+}
+
+func NewSilences(_ mesh.PeerName, mk types.Marker, logger log.Logger) *Silences {
+	return &Silences{
+		mk:     mk,
+		logger: logger,
+		st: &silenceState{
+			set: map[uint64]*model.Silence{},
+		},
+	}
+}
+
+func (s *Silences) Register(g mesh.Gossip) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.send = g
+}
+
+func (s *Silences) Mutes(lset model.LabelSet) bool {
+	sils, err := s.All()
+	if err != nil {
+		log.Errorf("retrieving silences failed: %s", err)
+		// In doubt, do not silence anything.
+		return false
+	}
+
+	for _, sil := range sils {
+		s.logger.Infoln("check", sil)
+		if sil.Mutes(lset) {
+			s.mk.SetSilenced(lset.Fingerprint(), sil.ID)
+			return true
+		}
+	}
+
+	s.mk.SetSilenced(lset.Fingerprint())
+	return false
+}
+
+func (s *Silences) All() ([]*types.Silence, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	res := make([]*types.Silence, 0, len(s.st.set))
+
+	s.st.mtx.RLock()
+	defer s.st.mtx.RUnlock()
+
+	s.logger.Infoln("silences", s.st.set)
+	for _, sil := range s.st.set {
+		res = append(res, types.NewSilence(sil))
+	}
+
+	return res, nil
+}
+
+func (s *Silences) Set(sil *types.Silence) (uint64, error) {
+	// TODO(fabxc): replace with UUIDs!!!
+	if sil.ID == 0 {
+		sil.ID = uint64(rand.Int63())
+	}
+
+	s.mtx.RLock()
+
+	update := &silenceState{
+		set: map[uint64]*model.Silence{
+			sil.ID: &sil.Silence,
+		},
+	}
+
+	// TODO(fabxc): add an updatedAt timestamp.
+	s.st = s.st.Merge(update).(*silenceState)
+
+	s.mtx.RUnlock()
+
+	s.send.GossipBroadcast(update)
+
+	return sil.ID, nil
+}
+
+func (s *Silences) Del(id uint64) error {
+	// XXX(fabxc): we likely want to switch to an approach in which deleting
+	// means to set the end timestamp to now.
+	panic("not implemented")
+}
+
+func (s *Silences) Get(id uint64) (*types.Silence, error) {
+	s.mtx.RLock()
+	s.st.mtx.RLock()
+
+	defer func() {
+		s.st.mtx.RUnlock()
+		s.mtx.RUnlock()
+	}()
+
+	sil, ok := s.st.set[id]
+	if !ok {
+		return nil, provider.ErrNotFound
+	}
+	return types.NewSilence(sil), nil
+}
+
+func (s *Silences) Gossip() mesh.GossipData {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.st.copy()
+}
+
+func (s *Silences) OnGossip(update []byte) (mesh.GossipData, error) {
+	var set map[uint64]*model.Silence
+	if err := gob.NewDecoder(bytes.NewReader(update)).Decode(&set); err != nil {
+		return nil, err
+	}
+
+	s.mtx.RLock()
+	s.st.mtx.Lock()
+
+	for k, v := range set {
+		if prev, ok := s.st.set[k]; ok {
+			if v.CreatedAt.Before(prev.CreatedAt) {
+				delete(set, k)
+				continue
+			}
+		}
+		s.st.set[k] = v
+	}
+
+	s.st.mtx.Unlock()
+	s.mtx.RUnlock()
+
+	if len(set) == 0 {
+		return nil, nil
+	}
+	return &silenceState{set: set}, nil
+}
+
+func (s *Silences) OnGossipBroadcast(p mesh.PeerName, update []byte) (mesh.GossipData, error) {
+	var set map[uint64]*model.Silence
+	if err := gob.NewDecoder(bytes.NewReader(update)).Decode(&set); err != nil {
+		return nil, err
+	}
+
+	s.mtx.RLock()
+	s.st.mtx.Lock()
+
+	for k, v := range set {
+		if prev, ok := s.st.set[k]; ok {
+			if v.CreatedAt.Before(prev.CreatedAt) {
+				delete(set, k)
+				continue
+			}
+		}
+		s.st.set[k] = v
+	}
+
+	s.st.mtx.Unlock()
+	s.mtx.RUnlock()
+	return &silenceState{set: set}, nil
+}
+
+func (s *Silences) OnGossipUnicast(sender mesh.PeerName, update []byte) error {
+	var set map[uint64]*model.Silence
+	if err := gob.NewDecoder(bytes.NewReader(update)).Decode(&set); err != nil {
+		return err
+	}
+
+	s.mtx.RLock()
+	s.st.mtx.Lock()
+
+	for k, v := range set {
+		if prev, ok := s.st.set[k]; ok {
+			if v.CreatedAt.Before(prev.CreatedAt) {
+				continue
+			}
+		}
+		s.st.set[k] = v
+	}
+
+	s.st.mtx.Unlock()
+	s.mtx.RUnlock()
+	return nil
+}
+
+type silenceState struct {
+	mtx sync.RWMutex
+	set map[uint64]*model.Silence
+}
+
+func (st *silenceState) Encode() [][]byte {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(&st.set); err != nil {
+		panic(err)
+	}
+	return [][]byte{buf.Bytes()}
+
+}
+
+func (st *silenceState) Merge(other mesh.GossipData) mesh.GossipData {
+	res := st.copy()
+
+	for k, v := range other.(*silenceState).set {
+		prev, ok := res.set[k]
+		if !ok {
+			res.set[k] = v
+			continue
+		}
+		// This theoretically allows modifying an existing silence.
+		// In practice we currently keep silences immutable and delete/create
+		// instead of modifying.
+		// It should probably have an UpdatedAt field here instead.
+		if prev.CreatedAt.Before(v.CreatedAt) {
+			res.set[k] = v
+		}
+	}
+	return res
+}
+
+func (s *silenceState) copy() *silenceState {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	res := &silenceState{
+		set: make(map[uint64]*model.Silence, len(s.set)),
+	}
+	for k, v := range s.set {
+		res.set[k] = v
 	}
 	return res
 }

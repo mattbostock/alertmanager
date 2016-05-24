@@ -117,6 +117,12 @@ func main() {
 	nic := mrouter.NewGossip("notify_info", ni)
 	ni.Register(nic)
 
+	marker := types.NewMarker()
+
+	silences := gossip.NewSilences(name, marker, log.With("peer", *nickname))
+	silc := mrouter.NewGossip("silences", silences)
+	silences.Register(silc)
+
 	mrouter.Start()
 	defer mrouter.Stop()
 
@@ -125,8 +131,6 @@ func main() {
 	if err := os.MkdirAll(*dataDir, 0777); err != nil {
 		log.Fatal(err)
 	}
-
-	marker := types.NewMarker()
 
 	alerts, err := boltmem.NewAlerts(*dataDir)
 	if err != nil {
@@ -140,11 +144,11 @@ func main() {
 	//}
 	//defer notifies.Close()
 
-	silences, err := boltmem.NewSilences(*dataDir, marker)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer silences.Close()
+	//silences, err := boltmem.NewSilences(*dataDir, marker)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//defer silences.Close()
 
 	var (
 		inhibitor *Inhibitor
