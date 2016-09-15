@@ -186,6 +186,7 @@ func (r *InhibitRule) set(a *types.Alert) {
 	r.mtx.Lock()
 	r.mtx.Unlock()
 
+	log.Infof("Putting %s in inhibit cache", a.Name())
 	r.scache[a.Fingerprint()] = a
 }
 
@@ -202,6 +203,7 @@ Outer:
 			continue
 		}
 		for n := range r.Equal {
+			log.Debugf("label %s values: %q %q", n, a.Labels[n], lset[n])
 			if a.Labels[n] != lset[n] {
 				continue Outer
 			}

@@ -39,12 +39,11 @@ receivers:
 
 inhibit_rules:
 - source_match:
-    alertname: JobDown
-  target_match:
-    alertname: InstanceDown
+    alertname: Instance_Down
+  target_match_re:
+    alertname: .*
   equal:
-    - job
-    - zone
+    - instance
 `
 
 	at := NewAcceptanceTest(t, &AcceptanceOpts{
@@ -56,24 +55,14 @@ inhibit_rules:
 
 	am := at.Alertmanager(fmt.Sprintf(conf, wh.Address()))
 
-	am.Push(At(1), Alert("alertname", "test1", "job", "testjob", "zone", "aa"))
-	am.Push(At(1), Alert("alertname", "InstanceDown", "job", "testjob", "zone", "aa"))
-	am.Push(At(1), Alert("alertname", "InstanceDown", "job", "testjob", "zone", "ab"))
+	am.Push(At(1), Alert("alertname", "Instance_Down", "job", "foo", "notify", "hipchat"))
 
 	// This JobDown in zone aa should inhibit InstanceDown in zone aa in the
 	// second batch of notifications.
 	am.Push(At(2.2), Alert("alertname", "JobDown", "job", "testjob", "zone", "aa"))
 
-	co.Want(Between(2, 2.5),
-		Alert("alertname", "test1", "job", "testjob", "zone", "aa").Active(1),
-		Alert("alertname", "InstanceDown", "job", "testjob", "zone", "aa").Active(1),
-		Alert("alertname", "InstanceDown", "job", "testjob", "zone", "ab").Active(1),
-	)
-
-	co.Want(Between(3, 3.5),
-		Alert("alertname", "test1", "job", "testjob", "zone", "aa").Active(1),
-		Alert("alertname", "InstanceDown", "job", "testjob", "zone", "ab").Active(1),
-		Alert("alertname", "JobDown", "job", "testjob", "zone", "aa").Active(2.2),
+	co.Want(Between(0, 5),
+		Alert("alertname", "Instance_Down", "job", "foo", "notify", "hipchat"),
 	)
 
 	at.Run()
